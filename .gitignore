@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 임시 파일
+data/temp/
+
+# API 키가 포함된 파일 (별도 관리 시)
+*.env
+
+# 엑셀 결과물
+*.xlsx
+
+# qt-material 임시 테마 파일
+custom_theme.xml
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code (CLAUDE.md는 별도 커밋)
+.claude/
+.claude_junction/
