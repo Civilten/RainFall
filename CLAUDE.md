@@ -32,8 +32,12 @@ WAMIS 및 KMA API를 연동하여 강우 관측 데이터 수집, Parquet 기반
 - [완료] 내장 DB 기반 엑셀 추출, DB 병합, DB 검토 요약 리포트, DB 편집
 - [완료] 관측소 DB 생성
 - [완료] API 실시간 다운로드 (날짜 범위 기반, 임시 DB 생성 후 엑셀 추출 및 자동 삭제)
+- [버그/보류] KMA 관측소 API 다운로드 시 종료일=오늘 설정 → 빈 결과 반환
+  - 원인: KMA API는 전일(T-1)까지만 데이터 제공, 당일 날짜 포함 청크 요청 시 에러 코드 반환 → 전체 청크 누락
+  - 위치: `api_fetcher.py` `fetch_kma_hourly_rainfall` (L:144), `fetch_kma_daily_max_rainfall` (L:260)
+  - 수정 방향: KMA 함수 내 end_date를 min(end_date, 어제)로 자동 보정
 - [예정] 사용자 편의성 중심 UI 수정
-- [예정] 프로그램 배포 준비
+- [예정] 프로그램 배포 준비 (docs/shareplan.md 참조)
 
 ## 상세 문서 (필요시 읽을 것)
 - docs/PROJECT_OVERVIEW.md  → 프로젝트 개요

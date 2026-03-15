@@ -78,11 +78,11 @@ def fetch_wamis_hourly_rainfall(stn_cd, start_year, end_year, start_date=None, e
                                 success = True
                                 break
                 except Exception as e:
-                    print(f"WAMIS API {year} ({start_dt}-{end_dt}) error: {e}")
+                    print(f"WAMIS API {start_dt[:4]} ({start_dt}-{end_dt}) error: {e}")
                     time.sleep(3)
             
             if not success:
-               print(f"WAMIS API failed for {year} ({start_dt}-{end_dt}) after 3 attempts.")
+               print(f"WAMIS API failed for {start_dt[:4]} ({start_dt}-{end_dt}) after 3 attempts.")
             
             time.sleep(1)
             
@@ -141,8 +141,9 @@ def fetch_kma_hourly_rainfall(stn_cd, start_year, end_year, start_date=None, end
             all_chunks += [(f"{year}0101", f"{year}0630"), (f"{year}0701", f"{year}1231")]
 
     for start_dt, end_dt in all_chunks:
+            kma_end_dt = (datetime.strptime(end_dt, "%Y%m%d") + timedelta(days=1)).strftime("%Y%m%d")
             for page in range(1, 10): # up to 10 pages, just in case
-                url = f"http://apis.data.go.kr/1360000/AsosHourlyInfoService/getWthrDataList?serviceKey={KMA_KEY}&numOfRows=999&pageNo={page}&dataType=JSON&dataCd=ASOS&dateCd=HR&stnIds={kma_cd}&endDt={end_dt}&endHh=00&startHh=01&startDt={start_dt}"
+                url = f"http://apis.data.go.kr/1360000/AsosHourlyInfoService/getWthrDataList?serviceKey={KMA_KEY}&numOfRows=999&pageNo={page}&dataType=JSON&dataCd=ASOS&dateCd=HR&stnIds={kma_cd}&endDt={kma_end_dt}&endHh=00&startHh=01&startDt={start_dt}"
                 
                 success = False
                 items_fetched = 0
@@ -199,7 +200,7 @@ def fetch_kma_hourly_rainfall(stn_cd, start_year, end_year, start_date=None, end
                                 else:
                                     time.sleep(2)
                     except Exception as e:
-                        print(f"KMA API {year} ({start_dt}-{end_dt}) error: {e}")
+                        print(f"KMA API {start_dt[:4]} ({start_dt}-{end_dt}) error: {e}")
                         time.sleep(3)
                         
                 if success and items_fetched < 999:
