@@ -1,6 +1,7 @@
 import sys
 import os
 import pandas as pd
+from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QTabWidget, QPushButton, QTableWidget,
                              QTableWidgetItem, QCheckBox, QLabel, QLineEdit,
@@ -8,21 +9,37 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QComboBox, QHeaderView, QFileDialog, QTableView, QDateEdit)
 from PyQt6.QtCore import Qt, QEvent, QTimer, QThread, pyqtSignal, QAbstractTableModel, QDate
 import shutil
+import json
 from qt_material import apply_stylesheet
 
 from api_fetcher import fetch_wamis_hourly_rainfall, fetch_kma_hourly_rainfall, fetch_kma_daily_max_rainfall
 from db_reviewer import generate_db_review_report
 from max_rainfall_calculator import process_hourly_to_max, convert_to_arbitrary_max_with_kma_yearly
+from fetch_station_db import fetch_obsinfo, decimal_to_dms
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_DIR = os.path.join(BASE_DIR, "data", "db_versions")
 TEMP_DIR = os.path.join(BASE_DIR, "data", "temp")
+CONFIG_PATH = os.path.join(BASE_DIR, "data", "config.json")
 MASTER_EXCEL_PATH = os.path.join(BASE_DIR, "data", "강우관측소(지역빈도).xlsx")
 
 # 개발자/버전 정보 상수
 APP_VERSION = "2.0"
 APP_AUTHOR = "김찬영"
 APP_DATE = "2023.11.28. (개정 2026.02)"
+
+def _make_output_subdir(base_dir: str) -> str:
+    """base_dir 아래에 강우YYMMDD_N 폴더를 생성 후 경로 반환. 중복 시 N 증가."""
+    date_str = datetime.now().strftime("%y%m%d")
+    n = 1
+    while True:
+        folder_name = f"강우{date_str}_{n}"
+        full_path = os.path.join(base_dir, folder_name)
+        if not os.path.exists(full_path):
+            os.makedirs(full_path)
+            return full_path
+        n += 1
+
 
 class PandasModel(QAbstractTableModel):
     def __init__(self, data):
@@ -110,9 +127,6 @@ class ApiDownloadThread(QThread):
                     daily_df = fetch_kma_daily_max_rainfall(code, self.start_yr, self.end_yr, self.start_date, self.end_date)
                     if not daily_df.empty:
                         all_kma_daily_data.append(daily_df)
-                        self.log_signal.emit(f"  -> 일/연최대 데이터 수집 완료")
-                    else:
-                        self.log_signal.emit(f"  -> 수집된 특수 DB 데이터 없음")
                     continue
 
                 if is_kma_station:
@@ -128,9 +142,6 @@ class ApiDownloadThread(QThread):
                 
                 if not df.empty:
                     all_new_data.append(df)
-                    self.log_signal.emit(f"  -> {len(df)} 건 수집 완료")
-                else:
-                    self.log_signal.emit(f"  -> 수집된 시강우 데이터 없음")
                     
             except Exception as e:
                 self.log_signal.emit(f"  -> 오류 발생: {e}")
@@ -166,7 +177,7 @@ class ApiDownloadThread(QThread):
             self.finished_signal.emit(False, "수집된 새로운 데이터가 없습니다.")
             return
             
-        self.log_signal.emit(f"다운로드 완료. 신규 DB 버전 [{self.new_version_name}] 세트 생성 중...")
+        self.log_signal.emit(f"다운로드 완료. Data 정리중...")
         try:
             new_df = pd.concat(all_new_data, ignore_index=True)
 
@@ -180,7 +191,7 @@ class ApiDownloadThread(QThread):
             # 1. 시강우 Parquet 저장
             new_df.to_parquet(hourly_path, index=False)
             
-            self.log_signal.emit(f"시강우 DB 저장 완료. 최대강우량(고정/임의) 자동 산출 중...")
+            self.log_signal.emit(f"최대강우량(고정/임의) 산출 중...")
             
             # 2. & 3. 고정시간 및 임의시간 최대강우량 산출 및 저장
             df_fixed, df_arb = process_hourly_to_max(new_df)
@@ -188,28 +199,21 @@ class ApiDownloadThread(QThread):
             df_fixed.to_parquet(fixed_path, index=False)
             df_arb.to_parquet(arb_path, index=False)
             
-            # 4. 기상청 일별 10/60분 최대 자료 저장 및 임시 엑셀 출력 (사용자 요청)
+            # 4. 기상청 일별 10/60분 최대 자료 저장
             daily_path = os.path.join(target_dir, "kma_daily_max.parquet")
             yearly_path = os.path.join(target_dir, "kma_yearly_max.parquet")
             daily_count = 0
             if all_kma_daily_data:
-                self.log_signal.emit(f"기상청 일자료(10/60분 최대) 압축 처리 중...")
+                self.log_signal.emit(f"기상청 10/60분 최대 강우 산출 중...")
                 new_daily_df = pd.concat(all_kma_daily_data, ignore_index=True)
                 new_daily_df.to_parquet(daily_path, index=False)
                 daily_count = len(new_daily_df)
-                
+
                 # 5. 연최대치 데이터프레임 추출 (10분/1시간 각각 최대값 산출)
-                self.log_signal.emit(f"기상청 일자료 연최대치(10분/1시간) 추가 산출 중...")
                 df_yearly = new_daily_df.groupby(['STN_CD', 'YEAR'])[['MI10_MAX_RN', 'HR1_MAX_RN']].max().reset_index()
                 df_yearly.to_parquet(yearly_path, index=False)
-                
-                # 임시: 방금 수집한 기상청 일자료를 바로 엑셀로 추출하여루트 폴더에 저장
-                test_excel_path = f"kma_daily_max_test_{self.new_version_name}.xlsx"
-                new_daily_df.to_excel(test_excel_path, index=False)
-                self.log_signal.emit(f"  -> [참고] 확인용 엑셀 추출 완료: {test_excel_path}")
             
             # 6. 임의시간 수정본 (arb_max_modified) 산출: df_fixed 원본에 환산계수를 곱하고 1-HR만 기상청 연최대치로 대체
-            self.log_signal.emit(f"6번째 DB(임의시간 수정본, 기상청 1-HR 대체) 산출 중...")
             mod_arb_path = os.path.join(target_dir, "arb_max_modified.parquet")
             if all_kma_daily_data and not df_yearly.empty:
                 df_arb_mod = convert_to_arbitrary_max_with_kma_yearly(df_fixed, df_yearly)
@@ -250,12 +254,10 @@ class FetchStationThread(QThread):
                 self.finished_signal.emit(False)
                 return
 
-            # wamis_station_db.xlsx 에 이전 헤더 컬럼 추가
+            # wamis_station_db.xlsx 에 군집 헤더 컬럼 추가
             out_path = os.path.join(self.base_dir, "wamis_station_db.xlsx")
             df = pd.read_excel(out_path)
-            df["군집"]          = ""
-            df["관측소코드-이전"] = ""
-            df["관측소명-이전"]  = ""
+            df["군집"] = ""
             with pd.ExcelWriter(out_path, engine="xlsxwriter") as writer:
                 df.to_excel(writer, index=False, sheet_name="관측소DB")
                 wb  = writer.book
@@ -266,7 +268,7 @@ class FetchStationThread(QThread):
                 })
                 for ci, cn in enumerate(df.columns):
                     ws.write(0, ci, cn, hdr)
-            self.log_signal.emit("✓ 헤더 컬럼 추가 완료: 군집 / 관측소코드-이전 / 관측소명-이전")
+            self.log_signal.emit("✓ 헤더 컬럼 추가 완료: 군집")
             self.finished_signal.emit(True)
         except Exception as e:
             self.log_signal.emit(f"오류: {e}")
@@ -284,6 +286,7 @@ class ConvertStaThread(QThread):
 
     def run(self):
         import subprocess
+        self.cancelled = False
         script = os.path.join(self.base_dir, "convert_sta_to_parquet.py")
         try:
             proc = subprocess.Popen(
@@ -294,6 +297,10 @@ class ConvertStaThread(QThread):
             for line in proc.stdout:
                 self.log_signal.emit(line.rstrip())
             proc.wait()
+            if proc.returncode == 2:  # 사용자 취소
+                self.cancelled = True
+                self.finished_signal.emit(False)
+                return
             if proc.returncode != 0:
                 self.log_signal.emit(f"스크립트 종료 코드: {proc.returncode}")
                 self.finished_signal.emit(False)
@@ -302,6 +309,344 @@ class ConvertStaThread(QThread):
         except Exception as e:
             self.log_signal.emit(f"오류: {e}")
             self.finished_signal.emit(False)
+
+
+class ExtractionThread(QThread):
+    log_signal      = pyqtSignal(str)
+    progress_signal = pyqtSignal(int)
+    finished_signal = pyqtSignal(bool, str)
+
+    def __init__(self, db_path, save_dir, start_yr, end_yr, selected_stations, sta_parquet_path):
+        super().__init__()
+        self.db_path = db_path
+        self.save_dir = save_dir
+        self.start_yr = start_yr
+        self.end_yr = end_yr
+        self.selected_stations = selected_stations
+        self.sta_parquet_path = sta_parquet_path
+
+    def run(self):
+        import xlsxwriter
+        selected_stations = self.selected_stations
+        db_path = self.db_path
+        save_dir = self.save_dir
+        start_yr = self.start_yr
+        end_yr = self.end_yr
+
+        self.log_signal.emit(f"총 {len(selected_stations)}개 관측소의 {start_yr}~{end_yr}년 데이터를 추출합니다...")
+
+        # 군집별로 분리
+        clusters_dict = {}
+        for stn in selected_stations:
+            c = stn['cluster'] if stn['cluster'] != '-' else '기타'
+            if c not in clusters_dict:
+                clusters_dict[c] = []
+            clusters_dict[c].append(stn['code'])
+
+        # Parquet DB 로딩
+        try:
+            df_hourly = pd.read_parquet(os.path.join(db_path, 'hourly.parquet'))
+            df_hourly_original = df_hourly.copy()
+            df_fixed = pd.read_parquet(os.path.join(db_path, 'fixed_max.parquet'))
+            df_arb = pd.read_parquet(os.path.join(db_path, 'arb_max.parquet'))
+
+            kma_daily_path = os.path.join(db_path, 'kma_daily_max.parquet')
+            df_kma_daily = pd.read_parquet(kma_daily_path) if os.path.exists(kma_daily_path) else pd.DataFrame()
+
+            kma_yearly_path = os.path.join(db_path, 'kma_yearly_max.parquet')
+            df_kma_yearly = pd.read_parquet(kma_yearly_path) if os.path.exists(kma_yearly_path) else pd.DataFrame()
+
+            arb_mod_path = os.path.join(db_path, 'arb_max_modified.parquet')
+            df_arb_mod = pd.read_parquet(arb_mod_path) if os.path.exists(arb_mod_path) else pd.DataFrame()
+        except Exception as e:
+            self.log_signal.emit(f"⚠️ 데이터베이스 로딩 실패: {e}\n(해당 버전 폴더 내 3가지 parquet 파일이 온전한지 확인해주세요.)")
+            self.finished_signal.emit(False, str(e))
+            return
+
+        # 데이터 연도 필터링
+        df_hourly = df_hourly[(df_hourly['YEAR'] >= start_yr) & (df_hourly['YEAR'] <= end_yr)]
+        df_fixed = df_fixed[(df_fixed['YEAR'] >= start_yr) & (df_fixed['YEAR'] <= end_yr)]
+        df_arb = df_arb[(df_arb['YEAR'] >= start_yr) & (df_arb['YEAR'] <= end_yr)]
+        if not df_kma_daily.empty:
+            df_kma_daily = df_kma_daily[(df_kma_daily['YEAR'] >= start_yr) & (df_kma_daily['YEAR'] <= end_yr)]
+        if not df_kma_yearly.empty:
+            df_kma_yearly = df_kma_yearly[(df_kma_yearly['YEAR'] >= start_yr) & (df_kma_yearly['YEAR'] <= end_yr)]
+        if not df_arb_mod.empty:
+            df_arb_mod = df_arb_mod[(df_arb_mod['YEAR'] >= start_yr) & (df_arb_mod['YEAR'] <= end_yr)]
+
+        # 군집별 폴더 생성 및 엑셀 저장
+        total_stations = len(selected_stations)
+        total_clusters = len(clusters_dict)
+        current_cluster = 0
+        processed_stations = 0
+
+        for cluster_name, codes in clusters_dict.items():
+            current_cluster += 1
+            folder_label = "기타 폴더" if cluster_name == '기타' else f"{cluster_name}군집 폴더"
+            self.log_signal.emit(f"[{current_cluster}/{total_clusters}] {folder_label} 생성 및 엑셀 작성 중...")
+
+            if cluster_name == '기타':
+                c_dir = os.path.join(save_dir, "기타")
+            else:
+                c_dir = os.path.join(save_dir, f"{cluster_name}군집")
+            os.makedirs(c_dir, exist_ok=True)
+
+            df_h_filtered = df_hourly[df_hourly['STN_CD'].isin(codes)]
+            df_f_filtered = df_fixed[df_fixed['STN_CD'].isin(codes)]
+            df_a_filtered = df_arb[df_arb['STN_CD'].isin(codes)]
+
+            # 1. 시강우.xlsx 생성
+            with pd.ExcelWriter(os.path.join(c_dir, "1. 시강우.xlsx"), engine='xlsxwriter') as writer:
+                for code in sorted(codes):
+                    stn_data = df_h_filtered[df_h_filtered['STN_CD'] == code].copy()
+                    if stn_data.empty:
+                        pd.DataFrame(columns=['연월일'] + [f'{i}시' for i in range(1, 25)]).to_excel(writer, sheet_name=str(code), index=False)
+                    else:
+                        stn_data['연월일'] = stn_data.apply(
+                            lambda row: f"{int(row['YEAR'])}-{int(row['MONTH']):02d}-{int(row['DAY']):02d}"
+                            if pd.notna(row['YEAR']) and pd.notna(row['MONTH']) and pd.notna(row['DAY']) else "", axis=1
+                        )
+                        cols = ['연월일'] + [f'H{i}' for i in range(1, 25)]
+                        output_df = stn_data[cols].copy()
+                        output_df.columns = ['연월일'] + [f'{i}시' for i in range(1, 25)]
+                        output_df.to_excel(writer, sheet_name=str(code), index=False)
+
+            # 2. 고정시간최대강우.xlsx 생성
+            with pd.ExcelWriter(os.path.join(c_dir, "2. 고정시간최대강우.xlsx"), engine='xlsxwriter') as writer:
+                for code in sorted(codes):
+                    stn_data = df_f_filtered[df_f_filtered['STN_CD'] == code].copy()
+                    if stn_data.empty:
+                        pd.DataFrame(columns=[''] + [i for i in range(1, 73)]).to_excel(writer, sheet_name=str(code), index=False)
+                    else:
+                        stn_data.rename(columns={'YEAR': '연도'}, inplace=True)
+                        cols = ['연도'] + [f'{i}-HR' for i in range(1, 73)]
+                        output_df = stn_data[cols].copy()
+                        output_df.columns = [''] + [i for i in range(1, 73)]
+                        output_df.to_excel(writer, sheet_name=str(code), index=False)
+
+            # 3. 임의시간최대강우.xlsx 생성
+            with pd.ExcelWriter(os.path.join(c_dir, "3. 임의시간최대강우.xlsx"), engine='xlsxwriter') as writer:
+                for code in sorted(codes):
+                    stn_data = df_a_filtered[df_a_filtered['STN_CD'] == code].copy()
+                    if stn_data.empty:
+                        pd.DataFrame(columns=[''] + [i for i in range(1, 73)]).to_excel(writer, sheet_name=str(code), index=False)
+                    else:
+                        stn_data.rename(columns={'YEAR': '연도'}, inplace=True)
+                        cols = ['연도'] + [f'{i}-HR' for i in range(1, 73)]
+                        output_df = stn_data[cols].copy()
+                        output_df.columns = [''] + [i for i in range(1, 73)]
+                        output_df.to_excel(writer, sheet_name=str(code), index=False)
+
+            # 1.1 기상청10_60min 강우.xlsx 생성
+            if not df_kma_daily.empty:
+                df_k_filtered = df_kma_daily[df_kma_daily['STN_CD'].isin(codes)]
+                if not df_k_filtered.empty:
+                    with pd.ExcelWriter(os.path.join(c_dir, "1.1 기상청10_60min 강우.xlsx"), engine='xlsxwriter') as writer:
+                        for code in sorted(codes):
+                            stn_data = df_k_filtered[df_k_filtered['STN_CD'] == code].copy()
+                            if stn_data.empty:
+                                pd.DataFrame(columns=['연월일', '10분 최다강수량', '1시간 최다강수량']).to_excel(writer, sheet_name=str(code), index=False)
+                            else:
+                                stn_data['연월일'] = stn_data.apply(
+                                    lambda row: f"{int(row['YEAR'])}-{int(row['MONTH']):02d}-{int(row['DAY']):02d}"
+                                    if pd.notna(row['YEAR']) and pd.notna(row['MONTH']) and pd.notna(row['DAY']) else "", axis=1
+                                )
+                                output_df = stn_data[['연월일', 'MI10_MAX_RN', 'HR1_MAX_RN']].copy()
+                                output_df.columns = ['연월일', '10분 최다강수량', '1시간 최다강수량']
+                                output_df.to_excel(writer, sheet_name=str(code), index=False)
+
+            # 2.1 기상청10_60min 연최대강우.xlsx 생성
+            if not df_kma_yearly.empty:
+                df_y_filtered = df_kma_yearly[df_kma_yearly['STN_CD'].isin(codes)]
+                if not df_y_filtered.empty:
+                    with pd.ExcelWriter(os.path.join(c_dir, "2.1 기상청10_60min 연최대강우.xlsx"), engine='xlsxwriter') as writer:
+                        for code in sorted(codes):
+                            stn_data = df_y_filtered[df_y_filtered['STN_CD'] == code].copy()
+                            if stn_data.empty:
+                                pd.DataFrame(columns=['연도', '10분 최다강수량', '1시간 최다강수량']).to_excel(writer, sheet_name=str(code), index=False)
+                            else:
+                                output_df = stn_data[['YEAR', 'MI10_MAX_RN', 'HR1_MAX_RN']].copy()
+                                output_df.columns = ['연도', '10분 최다강수량', '1시간 최다강수량']
+                                output_df.to_excel(writer, sheet_name=str(code), index=False)
+
+            # 3.1 임의시간최대강우_기상청60min적용.xlsx 생성
+            if not df_kma_daily.empty:
+                df_k_filtered = df_kma_daily[df_kma_daily['STN_CD'].isin(codes)]
+                if not df_k_filtered.empty:
+                    df_m_filtered = df_arb_mod[df_arb_mod['STN_CD'].isin(codes)]
+                    if not df_m_filtered.empty:
+                        with pd.ExcelWriter(os.path.join(c_dir, "3.1 임의시간최대강우_기상청60min적용.xlsx"), engine='xlsxwriter') as writer:
+                            for code in sorted(codes):
+                                stn_data = df_m_filtered[df_m_filtered['STN_CD'] == code].copy()
+                                if stn_data.empty:
+                                    pd.DataFrame(columns=[''] + [i for i in range(1, 73)]).to_excel(writer, sheet_name=str(code), index=False)
+                                else:
+                                    stn_data.rename(columns={'YEAR': '연도'}, inplace=True)
+                                    cols = ['연도'] + [f'{i}-HR' for i in range(1, 73)]
+                                    output_df = stn_data[cols].copy()
+                                    output_df.columns = [''] + [i for i in range(1, 73)]
+                                    output_df.to_excel(writer, sheet_name=str(code), index=False)
+
+            processed_stations += len(codes)
+            self.progress_signal.emit(int(processed_stations / total_stations * 90))
+
+        # 관측소 제원 엑셀 생성
+        try:
+            sta_df = pd.read_parquet(self.sta_parquet_path)
+            selected_codes = [stn['code'] for stn in selected_stations]
+            _write_station_info_excel(save_dir, sta_df, df_hourly_original, selected_codes)
+            self.log_signal.emit("✅ 0. 관측소제원.xlsx 저장 완료")
+        except Exception as e:
+            self.log_signal.emit(f"⚠️ 관측소제원.xlsx 생성 실패: {e}")
+        self.progress_signal.emit(100)
+
+        self.log_signal.emit(f"✅ 추출 완료! ({save_dir}에 결과 저장됨)")
+        self.finished_signal.emit(True, save_dir)
+
+
+def _write_station_info_excel(save_dir, sta_df, df_hourly_original, selected_codes):
+    import xlsxwriter
+
+    # 고정 14컬럼 스펙: (출력헤더, parquet컬럼명, API필드)
+    FIXED_SPEC = [
+        ("관측소코드",  "관측소코드",  None),
+        ("관측소명",    "관측소명",    "obsnm"),
+        ("수계명",      "수계명",      "bbsnnm"),
+        ("소유역코드",  "소유역코드",  "sbsncd"),
+        ("관리기관",    "관리기관",    "mngorg"),
+        ("폐쇄여부",    "폐쇄여부",    "clsyn"),
+        ("관측종류",    "관측종류",    "obsknd"),
+        ("개설일",      "개설일",      "opendt"),
+        ("주소",        "주소",        "addr"),
+        ("경도",        "경도",        "lon"),
+        ("위도",        "위도",        "lat"),
+        ("표고",        "표고(m)",     "shgt"),
+        ("시자료_시작", "시자료_시작", "hrdtstart"),
+        ("시자료_종료", "시자료_종료", "hrdtend"),
+    ]
+
+    # parquet 18개 고정 컬럼 — S열 이후 동적 컬럼 판별용
+    PARQUET_FIXED = {
+        "관측소코드", "관측소명", "영문명", "수계명", "소유역코드",
+        "관리기관", "폐쇄여부", "관측종류", "개설일", "주소",
+        "경도", "위도", "표고(m)", "시자료_시작", "시자료_종료",
+        "일자료_시작", "일자료_종료", "군집"
+    }
+    dynamic_cols = [c for c in sta_df.columns if c not in PARQUET_FIXED]
+
+    # 행2 헤더: 고정14 + 시자료_시작(강우DATA) + 시자료_종료(강우DATA) + 군집 + 동적
+    row2_headers = [spec[0] for spec in FIXED_SPEC] + ["시자료_시작", "시자료_종료", "군집"] + dynamic_cols
+
+    # 선택 코드로 sta_df 필터링 (parquet 원본 순서 유지)
+    code_set = set(str(c) for c in selected_codes)
+    sta_filtered = sta_df[sta_df["관측소코드"].astype(str).isin(code_set)]
+
+    # hourly.parquet 기반 관측소별 전체 기간 사전 계산
+    hourly_range = {}
+    for code in code_set:
+        rows = df_hourly_original[df_hourly_original["STN_CD"].astype(str) == code]
+        if rows.empty:
+            hourly_range[code] = ("", "")
+            continue
+        try:
+            dates = rows.apply(
+                lambda r: f"{int(r.YEAR)}-{int(r.MONTH):02d}-{int(r.DAY):02d}"
+                if pd.notna(r.YEAR) and pd.notna(r.MONTH) and pd.notna(r.DAY) else "",
+                axis=1
+            )
+            dates = sorted(d for d in dates if d)
+            hourly_range[code] = (dates[0], dates[-1]) if dates else ("", "")
+        except Exception:
+            hourly_range[code] = ("", "")
+
+    def is_empty(val):
+        return pd.isna(val) or str(val).strip() in ("", "nan", "NaN")
+
+    # 데이터 행 구성
+    rows_data = []
+    for _, stn_row in sta_filtered.iterrows():
+        code = str(stn_row["관측소코드"]).strip()
+        api_info = None  # lazy 로드
+
+        data_row = []
+        for _out_hdr, parq_col, api_field in FIXED_SPEC:
+            val = stn_row.get(parq_col, "")
+            if is_empty(val) and api_field:
+                if api_info is None:
+                    try:
+                        api_info = fetch_obsinfo(code)
+                    except Exception:
+                        api_info = {}
+                val = api_info.get(api_field, "") if api_info else ""
+            val_str = "" if is_empty(val) else str(val).strip()
+            if parq_col in ("경도", "위도") and val_str:
+                val_str = decimal_to_dms(val_str)
+            data_row.append(val_str)
+
+        # O, P: 강우DATA 시작/종료 (hourly.parquet 전체 기간)
+        o_start, p_end = hourly_range.get(code, ("", ""))
+        data_row.append(o_start)
+        data_row.append(p_end)
+
+        # Q: 군집
+        cluster_val = stn_row.get("군집", "")
+        if is_empty(cluster_val):
+            cluster_str = ""
+        else:
+            try:
+                cluster_str = str(int(float(str(cluster_val))))
+            except Exception:
+                cluster_str = str(cluster_val).strip()
+        data_row.append(cluster_str)
+
+        # 동적 컬럼 (R~)
+        for dc in dynamic_cols:
+            v = stn_row.get(dc, "")
+            data_row.append("" if is_empty(v) else str(v).strip())
+
+        rows_data.append(data_row)
+
+    # xlsxwriter로 저장
+    out_path = os.path.join(save_dir, "0. 관측소제원.xlsx")
+    workbook = xlsxwriter.Workbook(out_path)
+    ws = workbook.add_worksheet("관측소제원")
+
+    hdr_fmt = workbook.add_format({
+        "bold": True, "bg_color": "#1c9432",
+        "font_color": "white", "border": 1,
+        "align": "center", "valign": "vcenter"
+    })
+    hdr_bg_fmt = workbook.add_format({
+        "bg_color": "#1c9432", "border": 1
+    })
+    data_fmt = workbook.add_format({
+        "border": 1, "align": "center", "valign": "vcenter"
+    })
+
+    n_cols = len(row2_headers)
+
+    # 행1: 전 열 배경색, M:N 병합 '제원', O:P 병합 '강우DATA'
+    for ci in range(n_cols):
+        ws.write(0, ci, "", hdr_bg_fmt)
+    ws.merge_range(0, 12, 0, 13, "제원", hdr_fmt)
+    ws.merge_range(0, 14, 0, 15, "강우DATA", hdr_fmt)
+
+    # 행2: 컬럼명
+    for ci, hdr in enumerate(row2_headers):
+        ws.write(1, ci, hdr, hdr_fmt)
+
+    # 데이터 행
+    for ri, row_data in enumerate(rows_data):
+        for ci, val in enumerate(row_data):
+            ws.write(ri + 2, ci, val, data_fmt)
+
+    # 열 너비 자동 조정
+    for ci, hdr in enumerate(row2_headers):
+        col_vals = [r[ci] for r in rows_data]
+        max_len = max(len(hdr), max((len(str(v)) for v in col_vals), default=0))
+        ws.set_column(ci, ci, min(max_len + 2, 35))
+
+    workbook.close()
 
 
 class RainfallApp(QMainWindow):
@@ -395,12 +740,12 @@ class RainfallApp(QMainWindow):
         
         # 전체 선택/해제
         btn_layout = QHBoxLayout()
-        btn_select_all = QPushButton("전체 선택")
-        btn_deselect_all = QPushButton("전체 해제")
-        btn_select_all.clicked.connect(lambda: self.set_all_checkboxes(True))
-        btn_deselect_all.clicked.connect(lambda: self.set_all_checkboxes(False))
-        btn_layout.addWidget(btn_select_all)
-        btn_layout.addWidget(btn_deselect_all)
+        self.btn_select_all = QPushButton("전체 선택")
+        self.btn_deselect_all = QPushButton("전체 해제")
+        self.btn_select_all.clicked.connect(lambda: self.set_all_checkboxes(True))
+        self.btn_deselect_all.clicked.connect(lambda: self.set_all_checkboxes(False))
+        btn_layout.addWidget(self.btn_select_all)
+        btn_layout.addWidget(self.btn_deselect_all)
         
         # 테이블 
         self.station_table = QTableWidget(0, 6) # 선택, 군집, 코드, 이름, 대유역명, 기관
@@ -438,7 +783,7 @@ class RainfallApp(QMainWindow):
         # 1. 내장 고속 다운로드 탭
         self.tab_download_db = QWidget()
         self.setup_download_db_tab(self.tab_download_db)
-        self.tabs.addTab(self.tab_download_db, "내장 DB 기반 엑셀 추출")
+        self.tabs.addTab(self.tab_download_db, "내장 DB 기반 강우 추출")
         
         # [NEW] DB 버전 관리 및 병합 탭 (숨김 상태 보관용)
         self.tab_db_management = QWidget()
@@ -462,7 +807,11 @@ class RainfallApp(QMainWindow):
         # 관리자용 관측소 DB 생성 탭 (숨김 상태 보관용)
         self.tab_sta_db = QWidget()
         self.setup_sta_db_tab(self.tab_sta_db)
-        
+
+        # 관리자용 설정 탭 (숨김 상태 보관용)
+        self.tab_settings = QWidget()
+        self.setup_settings_tab(self.tab_settings)
+
         self.is_admin_mode = False
         
         layout.addWidget(self.tabs, 3)
@@ -491,21 +840,65 @@ class RainfallApp(QMainWindow):
 
     def refresh_db_combos(self):
         versions = self.get_db_versions()
-        self.db_combo.clear()
-        self.db_combo.addItems(versions)
-        
+
+        if hasattr(self, 'settings_db_combo'):
+            cfg = self._load_config()
+            saved = cfg.get("target_db_version", "")
+            self.settings_db_combo.blockSignals(True)
+            self.settings_db_combo.clear()
+            self.settings_db_combo.addItems(versions)
+            if saved in versions:
+                self.settings_db_combo.setCurrentText(saved)
+            self.settings_db_combo.blockSignals(False)
+            self._on_settings_db_changed(self.settings_db_combo.currentText())
+
         self.merge_combo1.clear()
         self.merge_combo1.addItems(versions)
         self.merge_combo2.clear()
         self.merge_combo2.addItems(versions)
-        
+
         if hasattr(self, 'report_combo'):
             self.report_combo.clear()
             self.report_combo.addItems(versions)
-            
+
         if hasattr(self, 'editor_db_combo'):
             self.editor_db_combo.clear()
             self.editor_db_combo.addItems(versions)
+
+    def setup_settings_tab(self, tab):
+        layout = QVBoxLayout(tab)
+        group = QGroupBox("내장 DB 기반 엑셀 추출 설정")
+        form = QHBoxLayout(group)
+        form.addWidget(QLabel("추출 타겟 DB 버전:"))
+        self.settings_db_combo = QComboBox()
+        form.addWidget(self.settings_db_combo)
+        form.addStretch()
+        layout.addWidget(group)
+        layout.addStretch()
+        self.settings_db_combo.currentTextChanged.connect(self._on_settings_db_changed)
+
+    def _load_config(self):
+        if os.path.exists(CONFIG_PATH):
+            try:
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def _save_config(self, key, value):
+        cfg = self._load_config()
+        cfg[key] = value
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _on_settings_db_changed(self, version_name):
+        self._save_config("target_db_version", version_name)
+        if hasattr(self, 'db_target_label'):
+            self.db_target_label.setText(f"추출 타겟 DB: {version_name}  (변경은 관리자 설정 탭에서)")
 
     def setup_update_tab(self, tab):
         layout = QVBoxLayout(tab)
@@ -649,7 +1042,7 @@ class RainfallApp(QMainWindow):
     def setup_db_editor_tab(self, tab):
         layout = QVBoxLayout(tab)
         
-        desc = QLabel("내장된 5가지 파케이 DB 파일을 엑셀처럼 표 형태로 보고 마음대로 수정합니다.")
+        desc = QLabel("내장된 6가지 파케이 DB 파일을 엑셀처럼 표 형태로 보고 마음대로 수정합니다.")
         
         group = QGroupBox("DB 로드 및 저장")
         form_layout = QHBoxLayout(group)
@@ -726,58 +1119,62 @@ class RainfallApp(QMainWindow):
 
     def setup_download_db_tab(self, tab):
         layout = QVBoxLayout(tab)
-        
-        desc = QLabel("현재 PC에 내장된 고속 통합 DB 버전 폴더 중 하나를 선택하여 원하는 기간을 엑셀로 추출합니다.")
-        
+
         group = QGroupBox("추출 설정")
         form_layout = QHBoxLayout(group)
-        
-        form_layout.addWidget(QLabel("추출할 타겟 DB 버전:"))
-        self.db_combo = QComboBox()
-        form_layout.addWidget(self.db_combo)
+
+        self.db_target_label = QLabel("추출 타겟 DB: (미설정)  (변경은 관리자 설정 탭에서)")
+        self.db_target_label.setStyleSheet("color: #555; font-style: italic;")
+        form_layout.addWidget(self.db_target_label)
         form_layout.addSpacing(20)
-        
+
         form_layout.addWidget(QLabel("시작 연도:"))
         self.db_start_year = QSpinBox()
         self.db_start_year.setRange(1900, 2099)
         self.db_start_year.setValue(1970)
-        
+
         form_layout.addWidget(QLabel(" ~ 종료 연도:"))
         self.db_end_year = QSpinBox()
         self.db_end_year.setRange(1900, 2099)
         self.db_end_year.setValue(2023)
-        
+
         form_layout.addWidget(self.db_start_year)
         form_layout.addWidget(self.db_end_year)
         form_layout.addStretch()
-        
-        btn_down = QPushButton("내장 DB에서 엑셀 파일 생성하기")
-        btn_down.setMinimumHeight(50)
-        btn_down.setStyleSheet("font-weight: bold; font-size: 11pt;")
-        btn_down.clicked.connect(self.run_db_extraction)
-        
-        layout.addWidget(desc)
+
+        self.btn_db_extract = QPushButton("내장 DB에서 엑셀 파일 생성하기")
+        self.btn_db_extract.setMinimumHeight(50)
+        self.btn_db_extract.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        self.btn_db_extract.clicked.connect(self.run_db_extraction)
+
+        desc_tabs = QTabWidget()
+        desc_tab = QWidget()
+        desc_tab_layout = QVBoxLayout(desc_tab)
+        desc_label = QLabel("~2017년: RFAHD 강우자료\n2018년~: wamis 및 기상청 제공 강우자료")
+        desc_label.setWordWrap(True)
+        desc_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        desc_tab_layout.addWidget(desc_label)
+        desc_tabs.addTab(desc_tab, "설명")
+
         layout.addWidget(group)
+        layout.addWidget(desc_tabs)
         layout.addStretch()
-        layout.addWidget(btn_down)
+        layout.addWidget(self.btn_db_extract)
 
     def setup_download_api_tab(self, tab):
         layout = QVBoxLayout(tab)
-
-        desc = QLabel("데이터베이스 저장 없이, 임시 분석을 위해 WAMIS/기상청에서 직접 즉시 다운로드 합니다.")
-        desc.setWordWrap(True)
 
         group = QGroupBox("실시간 API 대상 설정")
         form_layout = QHBoxLayout(group)
         form_layout.addWidget(QLabel("시작일:"))
         self.api_start_date = QDateEdit()
-        self.api_start_date.setDisplayFormat("yyyyMMdd")
+        self.api_start_date.setDisplayFormat("yyyy-MM-dd")
         self.api_start_date.setDate(QDate(2020, 1, 1))
         self.api_start_date.setCalendarPopup(True)
         form_layout.addWidget(self.api_start_date)
         form_layout.addWidget(QLabel(" ~ 종료일:"))
         self.api_end_date = QDateEdit()
-        self.api_end_date.setDisplayFormat("yyyyMMdd")
+        self.api_end_date.setDisplayFormat("yyyy-MM-dd")
         self.api_end_date.setDate(QDate.currentDate())
         self.api_end_date.setCalendarPopup(True)
         form_layout.addWidget(self.api_end_date)
@@ -788,14 +1185,22 @@ class RainfallApp(QMainWindow):
         self.btn_api_download.setStyleSheet("font-weight: bold; font-size: 11pt;")
         self.btn_api_download.clicked.connect(self.run_api_download)
 
-        layout.addWidget(desc)
+        api_desc_tabs = QTabWidget()
+        api_desc_tab = QWidget()
+        api_desc_tab_layout = QVBoxLayout(api_desc_tab)
+        api_desc_label = QLabel("wamis 및 기상청 제공 강우자료 다운로드")
+        api_desc_label.setWordWrap(True)
+        api_desc_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        api_desc_tab_layout.addWidget(api_desc_label)
+        api_desc_tabs.addTab(api_desc_tab, "설명")
+
         layout.addWidget(group)
+        layout.addWidget(api_desc_tabs)
         layout.addStretch()
         layout.addWidget(self.btn_api_download)
 
     def _load_station_table(self, parquet_path):
         db_name = os.path.basename(parquet_path)
-        self.log_msg(f"관측소 DB({db_name}) 로딩 중...")
 
         # 클러스터 체크박스 및 검색창 초기화
         self.search_input.blockSignals(True)
@@ -816,17 +1221,15 @@ class RainfallApp(QMainWindow):
             df = pd.read_parquet(parquet_path)
             valid_stations = []
             for _, row in df.iterrows():
-                code_val = str(row["관측소코드-이전"]).strip()
-                if not code_val or code_val == "nan":
-                    code_val = str(row["관측소코드"]).strip()
+                code_val = str(row["관측소코드"]).strip()
 
                 if len(code_val) >= 7 and code_val.isdigit():
                     cluster_raw = row["군집"]
                     cluster_val = "-" if pd.isna(cluster_raw) else str(int(cluster_raw))
 
-                    name_val = str(row["관측소명-이전"]).strip()
-                    if not name_val or name_val == "nan":
-                        name_val = str(row["관측소명"]).strip()
+                    name_val = str(row["관측소명"]).strip()
+                    if name_val == "nan":
+                        name_val = ""
 
                     valid_stations.append({
                         'cluster': cluster_val,
@@ -870,6 +1273,8 @@ class RainfallApp(QMainWindow):
             self._load_station_table(os.path.join(BASE_DIR, "data", "Sta1_db.parquet"))
         elif widget is self.tab_download_api:
             self._load_station_table(os.path.join(BASE_DIR, "data", "Sta2_db.parquet"))
+        elif widget is self.tab_update:
+            self._load_station_table(os.path.join(BASE_DIR, "data", "Sta1_db.parquet"))
 
     def run_api_download(self):
         if self.station_table.rowCount() == 0:
@@ -907,6 +1312,8 @@ class RainfallApp(QMainWindow):
         if not save_dir:
             return
 
+        save_dir = _make_output_subdir(save_dir)
+
         temp_path = os.path.join(TEMP_DIR, "api_download_temp")
         os.makedirs(temp_path, exist_ok=True)
 
@@ -916,7 +1323,7 @@ class RainfallApp(QMainWindow):
         self._api_end_yr = end_yr
         self._api_selected_stations = selected_stations
 
-        self.btn_api_download.setEnabled(False)
+        self._set_ui_enabled(False)
         self.progress_bar.setValue(0)
         self.log_msg(f"[API 다운로드] {start_date_str}~{end_date_str} / {len(selected_stations)}개 관측소")
 
@@ -925,30 +1332,73 @@ class RainfallApp(QMainWindow):
             save_path=temp_path, start_date=start_date_str, end_date=end_date_str
         )
         self.api_download_thread.log_signal.connect(self.log_msg)
-        self.api_download_thread.progress_signal.connect(self.progress_bar.setValue)
+        self.api_download_thread.progress_signal.connect(
+            lambda v: self.progress_bar.setValue(int(v * 0.9))
+        )
         self.api_download_thread.finished_signal.connect(self.on_api_download_finished)
         self.api_download_thread.start()
 
     def on_api_download_finished(self, success, msg):
-        self.btn_api_download.setEnabled(True)
         if not success:
+            self._set_ui_enabled(True)
             self.log_msg(f"❌ {msg}")
             QMessageBox.critical(self, "실패", msg)
             self._cleanup_temp_db()
             return
-        try:
-            self._do_extraction(
-                self._api_temp_db, self._api_save_dir,
-                self._api_start_yr, self._api_end_yr,
-                self._api_selected_stations
-            )
-        finally:
+        sta_parquet_path = os.path.join(BASE_DIR, "data", "Sta2_db.parquet")
+        self.extraction_thread = ExtractionThread(
+            self._api_temp_db, self._api_save_dir,
+            self._api_start_yr, self._api_end_yr,
+            self._api_selected_stations, sta_parquet_path
+        )
+        self.extraction_thread.log_signal.connect(self.log_msg)
+        self.extraction_thread.progress_signal.connect(
+            lambda v: self.progress_bar.setValue(int(90 + v * 0.1))
+        )
+        self.extraction_thread.finished_signal.connect(self.on_extraction_finished)
+        self.extraction_thread.start()
+
+    def on_extraction_finished(self, success, result_msg):
+        self._set_ui_enabled(True)
+        if hasattr(self, '_api_temp_db'):
             self._cleanup_temp_db()
+        if success:
+            self.progress_bar.setValue(100)
+            QMessageBox.information(self, "완료", "데이터 추출이 완료되었습니다.")
+        else:
+            self.log_msg(f"❌ 추출 실패: {result_msg}")
+            QMessageBox.critical(self, "실패", result_msg)
 
     def _cleanup_temp_db(self):
         if hasattr(self, '_api_temp_db') and os.path.exists(self._api_temp_db):
             shutil.rmtree(self._api_temp_db, ignore_errors=True)
             self.log_msg("임시 DB 정리 완료")
+
+    def _set_ui_enabled(self, enabled: bool):
+        """추출/다운로드 진행 중 UI 전체 잠금 (프로그램 정보 버튼 제외)."""
+        self.tabs.tabBar().setEnabled(enabled)
+        # 항상 존재하는 버튼 및 위젯
+        for w in [
+            self.btn_db_extract, self.btn_api_download,
+            self.btn_select_all, self.btn_deselect_all,
+            self.search_input, self.station_table,
+            self.db_start_year, self.db_end_year,
+            self.api_start_date, self.api_end_date,
+            self.settings_db_combo,
+        ]:
+            w.setEnabled(enabled)
+        for chk in self.cluster_checkboxes.values():
+            chk.setEnabled(enabled)
+        # 관리자 모드에서만 존재하는 위젯 (hasattr 방어)
+        for attr in [
+            'btn_admin_update', 'btn_admin_kma_only_update',
+            'btn_fetch_sta', 'btn_convert_sta',
+            'new_db_name_input', 'update_start_year', 'update_end_year',
+            'merge_target_name', 'merge_combo1', 'merge_combo2',
+            'report_combo', 'editor_db_combo', 'editor_file_combo',
+        ]:
+            if hasattr(self, attr):
+                getattr(self, attr).setEnabled(enabled)
 
     def filter_by_search(self):
         text = self.search_input.text().lower()
@@ -1121,6 +1571,8 @@ class RainfallApp(QMainWindow):
 
     def on_convert_sta_finished(self, success):
         self.btn_convert_sta.setEnabled(True)
+        if getattr(self.convert_sta_thread, 'cancelled', False):
+            return
         if success:
             self.log_msg("✅ Parquet DB 생성 완료. data/ 폴더에 저장됨.")
             QMessageBox.information(self, "완료", "Parquet DB 생성이 완료되었습니다.\ndata/ 폴더를 확인하세요.")
@@ -1242,7 +1694,7 @@ class RainfallApp(QMainWindow):
             QMessageBox.warning(self, "경고", "추출할 관측소를 먼저 선택해주세요!")
             return
 
-        db_version = self.db_combo.currentText()
+        db_version = self.settings_db_combo.currentText()
         if not db_version:
             QMessageBox.warning(self, "오류", "추출할 DB 버전이 선택되지 않았습니다.")
             return
@@ -1259,167 +1711,17 @@ class RainfallApp(QMainWindow):
         if not save_dir:
             return
 
+        save_dir = _make_output_subdir(save_dir)
+
         db_path = os.path.join(DB_DIR, db_version)
-        self._do_extraction(db_path, save_dir, start_yr, end_yr, selected_stations)
-
-    def _do_extraction(self, db_path, save_dir, start_yr, end_yr, selected_stations):
-        self.log_msg(f"총 {len(selected_stations)}개 관측소의 {start_yr}~{end_yr}년 데이터를 추출합니다...")
-
-        # 군집별로 분리
-        clusters_dict = {}
-        for stn in selected_stations:
-            c = stn['cluster'] if stn['cluster'] != '-' else '미분류'
-            if c not in clusters_dict:
-                clusters_dict[c] = []
-            clusters_dict[c].append(stn['code'])
-
-        # Parquet DB 로딩
-        try:
-            self.log_msg(f"Parquet DB 세트 로딩 중...")
-            df_hourly = pd.read_parquet(os.path.join(db_path, 'hourly.parquet'))
-            df_fixed = pd.read_parquet(os.path.join(db_path, 'fixed_max.parquet'))
-            df_arb = pd.read_parquet(os.path.join(db_path, 'arb_max.parquet'))
-
-            # 4번째 기상청 파케이 로드 (존재할 경우)
-            kma_daily_path = os.path.join(db_path, 'kma_daily_max.parquet')
-            df_kma_daily = pd.read_parquet(kma_daily_path) if os.path.exists(kma_daily_path) else pd.DataFrame()
-
-            # 5번째 기상청 연최대 파케이 로드 (존재할 경우)
-            kma_yearly_path = os.path.join(db_path, 'kma_yearly_max.parquet')
-            df_kma_yearly = pd.read_parquet(kma_yearly_path) if os.path.exists(kma_yearly_path) else pd.DataFrame()
-
-            # 6번째 임의시간 수정본 로드 (존재할 경우)
-            arb_mod_path = os.path.join(db_path, 'arb_max_modified.parquet')
-            df_arb_mod = pd.read_parquet(arb_mod_path) if os.path.exists(arb_mod_path) else pd.DataFrame()
-        except Exception as e:
-            self.log_msg(f"⚠️ 데이터베이스 로딩 실패: {e}\n(해당 버전 폴더 내 3가지 parquet 파일이 온전한지 확인해주세요.)")
-            return
-
-        # 데이터 연도 필터링
-        df_hourly = df_hourly[(df_hourly['YEAR'] >= start_yr) & (df_hourly['YEAR'] <= end_yr)]
-        df_fixed = df_fixed[(df_fixed['YEAR'] >= start_yr) & (df_fixed['YEAR'] <= end_yr)]
-        df_arb = df_arb[(df_arb['YEAR'] >= start_yr) & (df_arb['YEAR'] <= end_yr)]
-        if not df_kma_daily.empty:
-            df_kma_daily = df_kma_daily[(df_kma_daily['YEAR'] >= start_yr) & (df_kma_daily['YEAR'] <= end_yr)]
-        if not df_kma_yearly.empty:
-            df_kma_yearly = df_kma_yearly[(df_kma_yearly['YEAR'] >= start_yr) & (df_kma_yearly['YEAR'] <= end_yr)]
-        if not df_arb_mod.empty:
-            df_arb_mod = df_arb_mod[(df_arb_mod['YEAR'] >= start_yr) & (df_arb_mod['YEAR'] <= end_yr)]
-
-        # 군집별 폴더 생성 및 엑셀 저장
-        import xlsxwriter
-        total_clusters = len(clusters_dict)
-        current_cluster = 0
-
-        for cluster_name, codes in clusters_dict.items():
-            current_cluster += 1
-            self.log_msg(f"[{current_cluster}/{total_clusters}] {cluster_name}군집 폴더 생성 및 엑셀 작성 중...")
-
-            # 군집 폴더 생성
-            c_dir = os.path.join(save_dir, f"{cluster_name}군집")
-            os.makedirs(c_dir, exist_ok=True)
-
-            # 해당 군집의 코드만 필터링
-            df_h_filtered = df_hourly[df_hourly['STN_CD'].isin(codes)]
-            df_f_filtered = df_fixed[df_fixed['STN_CD'].isin(codes)]
-            df_a_filtered = df_arb[df_arb['STN_CD'].isin(codes)]
-
-            # 1. 시강우.xlsx 생성
-            with pd.ExcelWriter(os.path.join(c_dir, "1. 시강우.xlsx"), engine='xlsxwriter') as writer:
-                for code in sorted(codes):
-                    stn_data = df_h_filtered[df_h_filtered['STN_CD'] == code].copy()
-                    if stn_data.empty:
-                        pd.DataFrame(columns=['연월일'] + [f'{i}시' for i in range(1, 25)]).to_excel(writer, sheet_name=str(code), index=False)
-                    else:
-                        stn_data['연월일'] = stn_data.apply(
-                            lambda row: f"{int(row['YEAR'])}-{int(row['MONTH']):02d}-{int(row['DAY']):02d}"
-                            if pd.notna(row['YEAR']) and pd.notna(row['MONTH']) and pd.notna(row['DAY']) else "", axis=1
-                        )
-                        cols = ['연월일'] + [f'H{i}' for i in range(1, 25)]
-                        output_df = stn_data[cols].copy()
-                        output_df.columns = ['연월일'] + [f'{i}시' for i in range(1, 25)]
-                        output_df.to_excel(writer, sheet_name=str(code), index=False)
-
-            # 2. 고정시간최대강우.xlsx 생성
-            with pd.ExcelWriter(os.path.join(c_dir, "2. 고정시간최대강우.xlsx"), engine='xlsxwriter') as writer:
-                for code in sorted(codes):
-                    stn_data = df_f_filtered[df_f_filtered['STN_CD'] == code].copy()
-                    if stn_data.empty:
-                        pd.DataFrame(columns=[''] + [i for i in range(1, 73)]).to_excel(writer, sheet_name=str(code), index=False)
-                    else:
-                        stn_data.rename(columns={'YEAR': '연도'}, inplace=True)
-                        cols = ['연도'] + [f'{i}-HR' for i in range(1, 73)]
-                        output_df = stn_data[cols].copy()
-                        output_df.columns = [''] + [i for i in range(1, 73)]
-                        output_df.to_excel(writer, sheet_name=str(code), index=False)
-
-            # 3. 임의시간최대강우.xlsx 생성
-            with pd.ExcelWriter(os.path.join(c_dir, "3. 임의시간최대강우.xlsx"), engine='xlsxwriter') as writer:
-                for code in sorted(codes):
-                    stn_data = df_a_filtered[df_a_filtered['STN_CD'] == code].copy()
-                    if stn_data.empty:
-                        pd.DataFrame(columns=[''] + [i for i in range(1, 73)]).to_excel(writer, sheet_name=str(code), index=False)
-                    else:
-                        stn_data.rename(columns={'YEAR': '연도'}, inplace=True)
-                        cols = ['연도'] + [f'{i}-HR' for i in range(1, 73)]
-                        output_df = stn_data[cols].copy()
-                        output_df.columns = [''] + [i for i in range(1, 73)]
-                        output_df.to_excel(writer, sheet_name=str(code), index=False)
-
-            # 1.1 기상청10_60min 강우.xlsx 생성
-            if not df_kma_daily.empty:
-                df_k_filtered = df_kma_daily[df_kma_daily['STN_CD'].isin(codes)]
-                if not df_k_filtered.empty:
-                    with pd.ExcelWriter(os.path.join(c_dir, "1.1 기상청10_60min 강우.xlsx"), engine='xlsxwriter') as writer:
-                        for code in sorted(codes):
-                            stn_data = df_k_filtered[df_k_filtered['STN_CD'] == code].copy()
-                            if stn_data.empty:
-                                pd.DataFrame(columns=['연월일', '10분 최다강수량', '1시간 최다강수량']).to_excel(writer, sheet_name=str(code), index=False)
-                            else:
-                                stn_data['연월일'] = stn_data.apply(
-                                    lambda row: f"{int(row['YEAR'])}-{int(row['MONTH']):02d}-{int(row['DAY']):02d}"
-                                    if pd.notna(row['YEAR']) and pd.notna(row['MONTH']) and pd.notna(row['DAY']) else "", axis=1
-                                )
-                                output_df = stn_data[['연월일', 'MI10_MAX_RN', 'HR1_MAX_RN']].copy()
-                                output_df.columns = ['연월일', '10분 최다강수량', '1시간 최다강수량']
-                                output_df.to_excel(writer, sheet_name=str(code), index=False)
-
-            # 2.1 기상청10_60min 연최대강우.xlsx 생성
-            if not df_kma_yearly.empty:
-                df_y_filtered = df_kma_yearly[df_kma_yearly['STN_CD'].isin(codes)]
-                if not df_y_filtered.empty:
-                    with pd.ExcelWriter(os.path.join(c_dir, "2.1 기상청10_60min 연최대강우.xlsx"), engine='xlsxwriter') as writer:
-                        for code in sorted(codes):
-                            stn_data = df_y_filtered[df_y_filtered['STN_CD'] == code].copy()
-                            if stn_data.empty:
-                                pd.DataFrame(columns=['연도', '10분 최다강수량', '1시간 최다강수량']).to_excel(writer, sheet_name=str(code), index=False)
-                            else:
-                                output_df = stn_data[['YEAR', 'MI10_MAX_RN', 'HR1_MAX_RN']].copy()
-                                output_df.columns = ['연도', '10분 최다강수량', '1시간 최다강수량']
-                                output_df.to_excel(writer, sheet_name=str(code), index=False)
-
-            # 3.1 임의시간최대강우_기상청60min적용.xlsx 생성
-            if not df_kma_daily.empty:
-                df_k_filtered = df_kma_daily[df_kma_daily['STN_CD'].isin(codes)]
-                if not df_k_filtered.empty:
-                    df_m_filtered = df_arb_mod[df_arb_mod['STN_CD'].isin(codes)]
-                    if not df_m_filtered.empty:
-                        with pd.ExcelWriter(os.path.join(c_dir, "3.1 임의시간최대강우_기상청60min적용.xlsx"), engine='xlsxwriter') as writer:
-                            for code in sorted(codes):
-                                stn_data = df_m_filtered[df_m_filtered['STN_CD'] == code].copy()
-                                if stn_data.empty:
-                                    pd.DataFrame(columns=[''] + [i for i in range(1, 73)]).to_excel(writer, sheet_name=str(code), index=False)
-                                else:
-                                    stn_data.rename(columns={'YEAR': '연도'}, inplace=True)
-                                    cols = ['연도'] + [f'{i}-HR' for i in range(1, 73)]
-                                    output_df = stn_data[cols].copy()
-                                    output_df.columns = [''] + [i for i in range(1, 73)]
-                                    output_df.to_excel(writer, sheet_name=str(code), index=False)
-
-            self.progress_bar.setValue(int((current_cluster / total_clusters) * 100))
-
-        self.log_msg(f"✅ 추출 완료! ({save_dir}에 결과 저장됨)")
-        QMessageBox.information(self, "완료", "데이터 추출이 완료되었습니다.")
+        sta_parquet_path = os.path.join(BASE_DIR, "data", "Sta1_db.parquet")
+        self._set_ui_enabled(False)
+        self.progress_bar.setValue(0)
+        self.extraction_thread = ExtractionThread(db_path, save_dir, start_yr, end_yr, selected_stations, sta_parquet_path)
+        self.extraction_thread.log_signal.connect(self.log_msg)
+        self.extraction_thread.progress_signal.connect(self.progress_bar.setValue)
+        self.extraction_thread.finished_signal.connect(self.on_extraction_finished)
+        self.extraction_thread.start()
 
     def eventFilter(self, obj, event):
         # 관리자 모드 진입 트릭: 프로그램 메인 제목 라벨을 5번 연속 클릭할 경우 발생!
@@ -1438,11 +1740,12 @@ class RainfallApp(QMainWindow):
                     self.tabs.addTab(self.tab_db_editor, "🔒 [관리자] DB 편집 (DB Editor)")
                     self.tabs.addTab(self.tab_update, "🔒 [관리자] 내장 DB 연도별 업데이트")
                     self.tabs.addTab(self.tab_sta_db, "🔒 [관리자] 관측소 DB 생성")
+                    self.tabs.addTab(self.tab_settings, "🔒 [관리자] 설정")
                     self.log_msg("\n⚠️ [관리자 모드 활성화] 숨겨진 관리자 전용 모듈이 열렸습니다.")
                 else:
                     self.is_admin_mode = False
                     for i in reversed(range(self.tabs.count())):
-                        if self.tabs.widget(i) in [self.tab_update, self.tab_db_management, self.tab_db_editor, self.tab_sta_db]:
+                        if self.tabs.widget(i) in [self.tab_update, self.tab_db_management, self.tab_db_editor, self.tab_sta_db, self.tab_settings]:
                             self.tabs.removeTab(i)
                     self.log_msg("🔒 [관리자 모드 해제] 관리자 모듈 숨김처리 완료.")
                 return True
